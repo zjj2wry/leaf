@@ -3,18 +3,24 @@ package pkg
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"leaf/log"
+	"sync/atomic"
+
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
-
-	"errors"
 )
 
-var ERR_NO_API = errors.New("no api")
+var (
+	ERR_NO_API    = errors.New("no api")
+	ERR_NO_OBJECT = errors.New("no api object")
+	ERR_NO_MATCH  = errors.New("no prefix match")
+)
 
 type Api struct {
 	Method string
@@ -46,34 +52,38 @@ func NewApi(src io.Reader) ApiGeter {
 		defer mu.Unlock()
 
 		if api == nil {
-			return errors.New("no api object")
+			return ERR_NO_OBJECT
 		}
 
 		var line string
-		//read a line util it not null
+		//read a line util not null
 		for {
 			if !sc.Scan() {
 				return ERR_NO_API
 			}
 			line = strings.TrimSpace(sc.Text())
+			log.Infof("read line:%s", line)
 			if len(line) != 0 {
 				break
 			}
 		}
-
 		//format check
 		tokens := strings.SplitN(line, " ", 2)
 		if len(tokens) < 2 {
-			return fmt.Errorf("bad target: %s", line)
+			return fmt.Errorf("bad line: %s", line)
 		}
-		if !isHTTPMethod(line) {
+
+		if !isHTTPMethod(tokens[0]) {
 			return fmt.Errorf("bad method: %s", tokens[0])
 		}
 		api.Method = tokens[0]
+
 		if _, err = url.ParseRequestURI(tokens[1]); err != nil {
-			return fmt.Errorf("bad URL: %s", tokens[1])
+			log.Fatalf("bad Url: %s", tokens[1])
 		}
 		api.URL = tokens[1]
+
+		//get new line ,if null or prefix is httpmethod return
 		line = strings.TrimSpace(sc.Peek())
 
 		//null or http method return
@@ -84,28 +94,40 @@ func NewApi(src io.Reader) ApiGeter {
 			if line = strings.TrimSpace(sc.Text()); line == "" {
 				break
 			}
-			//read ret
+			log.Infof("read line:%s", line)
+
+			//read ret,if prefix is ret,break
 			if value, err := getRealValue(line, "ret"); err == nil {
 				api.ret = value[0]
 				break
 			}
-			//api body
-			if value, err := getRealValue(line, "ret"); err == nil {
-				if api.Body, err = ioutil.ReadFile(value[0]); err != nil {
-					return fmt.Errorf("bad body: %s", err)
+
+			//read api body
+			if value, err := getRealValue(line, "body"); err == nil {
+				if strings.HasPrefix(value[0], "@") {
+					if api.Body, err = ioutil.ReadFile(value[0][1:]); err != nil {
+						log.Fatal(err)
+					}
+				} else {
+					api.Body = []byte(value[0])
 				}
-			} else if value, err := getRealValue(line, "json"); err == nil {
-				api.Body = []byte(value[0])
 			}
-			//api header
+
+			//read api header; now just suport key1 = value1,value2 key2 = value2
 			if value, err := getRealValue(line, "header"); err == nil {
+				api.Header = make(map[string][]string)
+
 				for i := range value {
 					if value[i] = strings.TrimSpace(value[i]); value[i] == "" {
 						return fmt.Errorf("bad header: %s", line)
 					}
-					kv := strings.Split(value[i], ":")
+					if !strings.ContainsAny(value[i], "=") {
+						log.Fatal("header must use =")
+					}
+					kv := strings.Split(value[i], "=")
+					sl := strings.Split(kv[1], ",")
 
-					api.Header.Set(kv[0], kv[1])
+					api.Header[kv[0]] = sl
 				}
 			}
 
@@ -117,7 +139,7 @@ func NewApi(src io.Reader) ApiGeter {
 	}
 }
 
-func NewApiList(src io.Reader) ([]Api, error) {
+func NewApiList(src io.Reader) (ApiGeter, error) {
 	var (
 		ap   = NewApi(src)
 		apis []Api
@@ -127,6 +149,7 @@ func NewApiList(src io.Reader) ([]Api, error) {
 		if err := ap(&api); err == ERR_NO_API {
 			break
 		} else if err != nil {
+			log.Fatal(err)
 			return nil, err
 		}
 		apis = append(apis, api)
@@ -134,55 +157,50 @@ func NewApiList(src io.Reader) ([]Api, error) {
 	if len(apis) == 0 {
 		return nil, ERR_NO_API
 	}
-	return apis, nil
+	return getApiMultiple("sequence", apis...), nil
+}
+
+//now just suport sequence
+//TODO:
+//get api random
+//get api weight
+func getApiMultiple(mode string, apis ...Api) ApiGeter {
+	i := int64(-1)
+
+	switch mode {
+	case "random":
+		return nil
+	case "weight":
+		return nil
+	default:
+		return func(api *Api) error {
+			*api = apis[atomic.AddInt64(&i, 1)%int64(len(apis))]
+			return nil
+		}
+	}
 }
 
 //check first word and return other value
 func getRealValue(line, pre string) ([]string, error) {
 	if !strings.HasPrefix(line, pre) {
-		return nil, errors.New("no head match")
+		return nil, ERR_NO_MATCH
 	}
+
 	tokens := strings.Split(line, " ")
 	if len(tokens) < 2 {
 		return nil, fmt.Errorf("bad format: %s", line)
 	}
+
 	return tokens[1:], nil
 }
 
+//check method
 func isHTTPMethod(method string) bool {
-	return true
-}
-
-//just use peek instead of Scan()+Text()
-type peekingScanner struct {
-	src    *bufio.Scanner
-	peeked string
-}
-
-func (s *peekingScanner) Err() error {
-	return s.src.Err()
-}
-
-func (s *peekingScanner) Peek() string {
-	if !s.src.Scan() {
-		return ""
+	var array2 = [...]string{"GET", "POST", "PUT", "DELETE"}
+	for _, value := range array2 {
+		if strings.ToUpper(method) == value {
+			return true
+		}
 	}
-	s.peeked = s.src.Text()
-	return s.peeked
-}
-
-func (s *peekingScanner) Scan() bool {
-	if s.peeked == "" {
-		return s.src.Scan()
-	}
-	return true
-}
-
-func (s *peekingScanner) Text() string {
-	if s.peeked == "" {
-		return s.src.Text()
-	}
-	t := s.peeked
-	s.peeked = ""
-	return t
+	return false
 }

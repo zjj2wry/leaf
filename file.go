@@ -4,7 +4,7 @@ import (
 	"os"
 )
 
-func file(name string, create bool) (*os.File, error) {
+func File(name string, create bool) (*os.File, error) {
 	switch name {
 	case "stdin":
 		return os.Stdin, nil
